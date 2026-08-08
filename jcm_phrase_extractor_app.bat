@@ -1,0 +1,1 @@
+python -m streamlit run jcm_phrase_extractor_app.py
