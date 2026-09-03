@@ -5,33 +5,28 @@ import xml.etree.ElementTree as ET
 import google.generativeai as genai
 from dotenv import load_dotenv
 import time
-import json  # ←追加
-import csv   # ←追加
+import json
+import csv
 
 # ==========================================
-# 1. 初期設定とAPIキー読み込み
+# 1. 初期設定 (APIキーとモデルの準備)
 # ==========================================
-st.set_page_config(page_title="Paper Phrase Extractor", page_icon="🔍")
-
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not API_KEY:
-    st.error("⚠️ `.env` ファイルが見つからないか、`GEMINI_API_KEY` が設定されていません。")
+if API_KEY:
+    genai.configure(api_key=API_KEY)
+    model = genai.GenerativeModel("gemini-3.6-flash")
+else:
+    st.error("GEMINI_API_KEYが設定されていません。.envファイルを確認してください。")
     st.stop()
-
-genai.configure(api_key=API_KEY)
-# 最新の 3.6 Flash を指定
-model = genai.GenerativeModel("gemini-3.6-flash")
 
 # ==========================================
 # 2. PubMed / PMC 検索・取得関数
 # ==========================================
 def fetch_articles(keyword, journal, max_results, search_type, offset=0):
-    # search_type: 'abstract' (PubMed) or 'fulltext' (PMC)
     db = "pubmed" if search_type == "アブストラクトのみ" else "pmc"
     
-    # 検索クエリの構築
     query = f'"{keyword}"[All Fields] AND "{journal}"[Journal]'
     
     st.write(f"🔍 {db.upper()} データベースで検索中... (クエリ: {query} / {offset}件目からスキップして取得)")
@@ -39,7 +34,6 @@ def fetch_articles(keyword, journal, max_results, search_type, offset=0):
     # ESearch API (retstartを追加して取得開始位置をズラす)
     search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db={db}&term={query}&retmode=json&retmax={max_results}&retstart={offset}"
     
-    # 【復元】ここが抜けていました！URLに対して実際にリクエストを送ります
     response = requests.get(search_url)
     
     if response.status_code != 200:
@@ -63,18 +57,15 @@ def fetch_articles(keyword, journal, max_results, search_type, offset=0):
     root = ET.fromstring(fetch_response.content)
     
     if db == "pubmed":
-        # PubMedの場合はアブストラクトを抽出
         for article in root.findall('.//PubmedArticle'):
             abstract_texts = article.findall('.//AbstractText')
             if abstract_texts:
                 abstract = " ".join([elem.text for elem in abstract_texts if elem.text])
                 articles_text.append(abstract)
     else:
-        # PMCの場合は全文（bodyタグ内）を抽出
         for article in root.findall('.//article'):
             bodies = article.findall('.//body')
             for body in bodies:
-                # itertext() でXMLタグを除去したプレーンテキストを取得
                 full_text = " ".join(body.itertext())
                 articles_text.append(full_text)
                 
@@ -82,10 +73,9 @@ def fetch_articles(keyword, journal, max_results, search_type, offset=0):
     return articles_text
 
 # ==========================================
-# 3. Gemini による複数論文「横断」フレーズ抽出関数（絶対崩れないプロ仕様）
+# 3. Gemini による複数論文「横断」フレーズ抽出関数
 # ==========================================
 def extract_and_save_phrases(articles_text, output_csv="phrases.csv"):
-    # 【修正】JSONの見本の波括弧 {} を {{ }} にしてPythonの誤作動を防ぎました
     prompt_template = """
     あなたはネイティブの医学論文査読者です。以下の【複数の医学論文】のテキスト全文を横断的に分析し、
     これらの論文間で共通して頻出する、学術英語の論文執筆で非常に使い回しやすい「汎用的なフレーズ（型）」を 合計15個 抽出し、JSON形式で出力してください。
@@ -114,6 +104,7 @@ def extract_and_save_phrases(articles_text, output_csv="phrases.csv"):
     try:
         prompt = prompt_template.format(combined_text=combined_articles)
         
+        # Geminiに「絶対にJSON形式以外を出力するな」とAPIレベルで強制
         response = model.generate_content(
             prompt,
             generation_config=genai.GenerationConfig(
@@ -123,6 +114,7 @@ def extract_and_save_phrases(articles_text, output_csv="phrases.csv"):
         
         data = json.loads(response.text)
         
+        # 辞書型で返ってきた場合の対策
         if isinstance(data, dict):
             for key, value in data.items():
                 if isinstance(value, list):
@@ -131,6 +123,7 @@ def extract_and_save_phrases(articles_text, output_csv="phrases.csv"):
             else:
                 data = [data]
                 
+        # キー名に含まれる改行や空白を強制的に削除して安全化
         clean_data = []
         for item in data:
             clean_item = {str(k).strip().replace('"', ''): str(v).strip() for k, v in item.items()}
@@ -160,30 +153,42 @@ def extract_and_save_phrases(articles_text, output_csv="phrases.csv"):
 # 4. Streamlit UI構築
 # ==========================================
 st.title("論文フレーズ自動抽出システム 🤖")
-st.write("PubMed/PMCから論文を検索し、Gemini 3.6 Flashが直接 `phrases.csv` に学習問題を追加します。")
+st.write("PubMed/PMCから論文を検索し、Geminiに横断分析させて学習問題を追加します。")
+
+# 臨床微生物学・感染症領域のトップジャーナル10選
+JOURNAL_LIST = [
+    "Journal of clinical microbiology",
+    "Journal of antimicrobial chemotherapy",
+    "Clinical microbiology and infection",
+    "International journal of antimicrobial agents",
+    "Antimicrobial agents and chemotherapy",
+    "Clinical infectious diseases",
+    "The Lancet infectious diseases",
+    "Emerging infectious diseases",
+    "European journal of clinical microbiology & infectious diseases",
+    "Journal of infection"
+]
 
 with st.form("search_form"):
     st.subheader("検索条件の設定")
     
-    # 【修正】ここでcol1とcol2を定義しています
     col1, col2 = st.columns(2)
     
     with col1:
         keyword = st.text_input("検索キーワード", value="sputum image analysis")
-        journal = st.text_input("対象ジャーナル", value="Journal of clinical microbiology")
+        journal = st.selectbox("対象ジャーナル", options=JOURNAL_LIST)
+        
     with col2:
         search_type = st.radio("検索範囲", ["アブストラクトのみ", "全文（PubMed Central）"])
         max_results = st.number_input("取得する論文数", min_value=1, max_value=10, value=5)
-        # スキップ件数の設定を追加
         offset = st.number_input("検索開始位置 (スキップ件数)", min_value=0, value=0, step=5, help="同じキーワードで再度検索する場合は、ここの数字を増やして重複を避けます。")
         
     submit_btn = st.form_submit_button("検索＆フレーズ抽出を開始")
 
 if submit_btn:
     with st.spinner("PubMed/PMCからデータを取得しています..."):
-        # offsetを関数に渡す
         articles = fetch_articles(keyword, journal, max_results, search_type, offset)
         
     if articles:
-        with st.spinner("Gemini 3.6 Flash がフレーズを抽出し、CSVに書き込んでいます..."):
+        with st.spinner("Gemini がフレーズを抽出し、CSVに書き込んでいます..."):
             extract_and_save_phrases(articles, output_csv="phrases.csv")
